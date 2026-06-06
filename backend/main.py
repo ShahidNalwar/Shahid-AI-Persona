@@ -8,6 +8,7 @@ import chromadb
 from sentence_transformers import SentenceTransformer
 from groq import Groq
 from dotenv import load_dotenv
+from fastapi.responses import JSONResponse
 
 # Load env variables
 load_dotenv(dotenv_path=".env.local")
@@ -323,17 +324,28 @@ def openai_compatible_endpoint(request: ChatCompletionRequest):
             reply = "I'm having trouble retrieving that information right now."
 
     # Return OpenAI-compatible response format
-    return {
+
+
+    return JSONResponse(content={
         "id": "chatcmpl-001",
         "object": "chat.completion",
-        "model": request.model,
-        "choices": [{
-            "index": 0,
-            "message": {"role": "assistant", "content": reply},
-            "finish_reason": "stop"
-        }],
-        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-    }
+        "model": request.model or "llama-3.3-70b-versatile",
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": reply
+                },
+                "finish_reason": "stop"
+            }
+        ],
+        "usage": {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0
+        }
+    })
 
 
 @app.post("/ingest", response_model=IngestResponse)
