@@ -1,15 +1,15 @@
 import os
 import uvicorn
+import httpx
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 import chromadb
 from sentence_transformers import SentenceTransformer
 from groq import Groq
 from dotenv import load_dotenv
-from fastapi.responses import JSONResponse
-from booking import check_availability, book_slot, BookSlotRequest, CheckAvailabilityRequest
 
 # Load env variables
 load_dotenv(dotenv_path=".env.local")
@@ -24,7 +24,6 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# CORS Middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -33,12 +32,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global variables
+# ── Global variables ───────────────────────────────────────────────────────────
 model = None
 chroma_client = None
 collection = None
 
-# Prompt injection detection
+# ── Cal.com config ─────────────────────────────────────────────────────────────
+CALCOM_EVENT_TYPE_ID = 5919637
+CALCOM_USERNAME = "shahid-nalwar-bf5bxg"
+CALCOM_BASE_URL = "https://api.cal.com/v2"
+
+# ── Prompt injection keywords ──────────────────────────────────────────────────
 PROMPT_INJECTION_KEYWORDS = [
     "ignore previous instructions", "ignore all previous", "ignore above",
     "forget all instructions", "new instructions", "system prompt",
@@ -46,9 +50,7 @@ PROMPT_INJECTION_KEYWORDS = [
     "jailbreak", "developer mode", "dan mode"
 ]
 
-# ── Manual high-priority knowledge chunks ──────────────────────────────────────
-# These ensure critical questions always get grounded answers regardless of
-# how the code was chunked during ingestion.
+# ── Manual knowledge chunks ────────────────────────────────────────────────────
 MANUAL_CHUNKS = [
     {
         "text": """The ingest.py file in the backend does the following steps:
@@ -62,14 +64,14 @@ MANUAL_CHUNKS = [
 8. Embeds all chunks using SentenceTransformer all-MiniLM-L6-v2
 9. Stores everything in ChromaDB persistent vector database called shahid_knowledge_base
 10. Ingests in batches of 100 to avoid memory limits
-Total: 305+ documents ingested.""",
+Total: 312 documents ingested.""",
         "metadata": {"source": "manual", "file_path": "backend/ingest.py", "file_type": "documentation", "chunk_index": 0}
     },
     {
         "text": """Shahid Nalwar's AI Persona architecture:
 - Frontend: Next.js deployed on Vercel. Chat UI with suggestion chips, message history, and booking link.
 - Backend: FastAPI deployed on Railway. Handles RAG queries, OpenAI-compatible /v1/chat/completions for ElevenLabs, and background ingestion.
-- Vector Database: ChromaDB (persistent) with 305+ documents from 5 GitHub repos, commit history, and resume.
+- Vector Database: ChromaDB (persistent) with 312 documents from 5 GitHub repos, commit history, and resume.
 - Embedding Model: SentenceTransformer all-MiniLM-L6-v2 running locally in the container.
 - LLM: Groq API with Llama 3.3 70B Versatile for fast inference (~200ms).
 - Voice Agent: ElevenLabs Conversational AI connected to Railway backend via Custom LLM endpoint.
@@ -122,6 +124,7 @@ Total: 305+ documents ingested.""",
     }
 ]
 
+# ── Pydantic models ────────────────────────────────────────────────────────────
 class QueryRequest(BaseModel):
     message: str
     history: Optional[List[Dict[str, str]]] = []
@@ -134,7 +137,6 @@ class IngestResponse(BaseModel):
     status: str
     message: str
 
-# OpenAI-compatible models for ElevenLabs
 class ChatMessage(BaseModel):
     role: str
     content: str
@@ -146,15 +148,30 @@ class ChatCompletionRequest(BaseModel):
     temperature: Optional[float] = 0.25
     stream: Optional[bool] = False
 
+class CheckAvailabilityRequest(BaseModel):
+    date: str
+    timezone: Optional[str] = "Asia/Kolkata"
+
+class BookSlotRequest(BaseModel):
+    name: str
+    email: str
+    start_time: str
+    timezone: Optional[str] = "Asia/Kolkata"
+    notes: Optional[str] = ""
+
+# ── Helper functions ───────────────────────────────────────────────────────────
 def detect_prompt_injection(text: str) -> bool:
     text_lower = text.lower()
     return any(keyword in text_lower for keyword in PROMPT_INJECTION_KEYWORDS)
 
-def get_rag_answer(user_message: str, history: list = []) -> tuple[str, list]:
-    """
-    Core RAG function: embed query → retrieve chunks → synthesize answer.
-    Returns (reply, retrieved_chunks).
-    """
+def get_calcom_headers():
+    return {
+        "Authorization": f"Bearer {os.getenv('CALCOM_API_KEY')}",
+        "Content-Type": "application/json",
+        "cal-api-version": "2024-08-13"
+    }
+
+def get_rag_answer(user_message: str, history: list = []):
     global model, collection
 
     if model is None:
@@ -165,7 +182,6 @@ def get_rag_answer(user_message: str, history: list = []) -> tuple[str, list]:
         except Exception:
             raise HTTPException(status_code=503, detail="Database not initialized.")
 
-    # Embed and retrieve — increased to 10 results for better coverage
     query_vector = model.encode(user_message).tolist()
     results = collection.query(query_embeddings=[query_vector], n_results=10)
 
@@ -193,7 +209,7 @@ def get_rag_answer(user_message: str, history: list = []) -> tuple[str, list]:
 
     context = "\n\n".join(context_parts) if context_parts else "No relevant context found."
 
-    system_prompt = f"""You are Shahid Nalwar's AI persona — a chat-based representative of Shahid Nalwar, a B.Tech AI and Data Science student at N.K. Orchid College of Engineering, Solapur, applying for the AI Engineer Intern role at Scaler.
+    system_prompt = f"""You are Shahid Nalwar's AI persona — a representative of Shahid Nalwar, a B.Tech AI and Data Science student at N.K. Orchid College of Engineering, Solapur, applying for the AI Engineer Intern role at Scaler.
 
 Answer in the first person ("I", "my") as Shahid himself.
 
@@ -221,7 +237,6 @@ RULES:
     if not groq_api_key:
         raise HTTPException(status_code=500, detail="GROQ_API_KEY not set.")
 
-    import httpx
     client_groq = Groq(api_key=groq_api_key, http_client=httpx.Client())
     chat_completion = client_groq.chat.completions.create(
         messages=messages,
@@ -229,10 +244,9 @@ RULES:
         temperature=0.25,
         max_tokens=350,
     )
-    reply = chat_completion.choices[0].message.content
-    return reply, retrieved_chunks
+    return chat_completion.choices[0].message.content, retrieved_chunks
 
-
+# ── Startup ────────────────────────────────────────────────────────────────────
 @app.on_event("startup")
 def startup_event():
     global model, chroma_client, collection
@@ -252,9 +266,8 @@ def startup_event():
         print(f"Connected to collection '{collection_name}' with {count} documents.")
     except Exception as e:
         print(f"Warning: Collection '{collection_name}' not found or empty: {e}")
-        print("Please run /ingest or run backend/ingest.py locally to initialize the database.")
 
-
+# ── Routes ─────────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health_check():
     db_loaded = collection is not None
@@ -276,7 +289,6 @@ def health_check():
 def query_rag(request: QueryRequest):
     if detect_prompt_injection(request.message):
         return {"reply": "I am Shahid's AI persona, let's stay on topic.", "chunks": []}
-
     try:
         reply, chunks = get_rag_answer(request.message, request.history)
         return {"reply": reply, "chunks": chunks}
@@ -289,11 +301,6 @@ def query_rag(request: QueryRequest):
 
 @app.post("/v1/chat/completions")
 def openai_compatible_endpoint(request: ChatCompletionRequest):
-    """
-    OpenAI-compatible endpoint for ElevenLabs Custom LLM integration.
-    Extracts the last user message and runs it through the RAG pipeline.
-    """
-    # Extract last user message
     user_message = ""
     history = []
     for msg in request.messages:
@@ -306,47 +313,124 @@ def openai_compatible_endpoint(request: ChatCompletionRequest):
             history.append({"role": "assistant", "content": msg.content})
 
     if not user_message:
-        return {
-            "id": "chatcmpl-001",
-            "object": "chat.completion",
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": "How can I help you?"},
-                "finish_reason": "stop"
-            }]
-        }
-
-    if detect_prompt_injection(user_message):
+        reply = "Hi! I'm Shahid's AI persona. How can I help you?"
+    elif detect_prompt_injection(user_message):
         reply = "I am Shahid's AI persona, let's stay on topic."
     else:
         try:
             reply, _ = get_rag_answer(user_message, history[:-1])
         except Exception as e:
+            print(f"ElevenLabs endpoint error: {e}")
             reply = "I'm having trouble retrieving that information right now."
-
-    # Return OpenAI-compatible response format
-
 
     return JSONResponse(content={
         "id": "chatcmpl-001",
         "object": "chat.completion",
         "model": request.model or "llama-3.3-70b-versatile",
-        "choices": [
-            {
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": reply
-                },
-                "finish_reason": "stop"
-            }
-        ],
-        "usage": {
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0
-        }
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": reply},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     })
+
+
+@app.post("/check-availability")
+def check_availability_endpoint(request: CheckAvailabilityRequest):
+    calcom_api_key = os.getenv("CALCOM_API_KEY")
+    if not calcom_api_key:
+        raise HTTPException(status_code=500, detail="CALCOM_API_KEY not set.")
+    try:
+        start = f"{request.date}T00:00:00Z"
+        end = f"{request.date}T23:59:59Z"
+        with httpx.Client() as client:
+            response = client.get(
+                f"{CALCOM_BASE_URL}/slots",
+                headers=get_calcom_headers(),
+                params={
+                    "eventTypeId": CALCOM_EVENT_TYPE_ID,
+                    "startTime": start,
+                    "endTime": end,
+                    "timeZone": request.timezone
+                }
+            )
+        if response.status_code != 200:
+            raise HTTPException(status_code=response.status_code, detail=response.text)
+
+        slots_data = response.json().get("data", {}).get("slots", {})
+        available_times = []
+        for day_slots in slots_data.values():
+            for slot in day_slots:
+                available_times.append(slot.get("time", ""))
+
+        if not available_times:
+            return {
+                "available": False,
+                "message": f"No available slots on {request.date}. Please try another date.",
+                "slots": []
+            }
+
+        top_slots = available_times[:5]
+        readable = ", ".join([s[11:16] for s in top_slots])
+        return {
+            "available": True,
+            "date": request.date,
+            "slots": top_slots,
+            "message": f"Available slots on {request.date}: {readable} IST"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/book-slot")
+def book_slot_endpoint(request: BookSlotRequest):
+    calcom_api_key = os.getenv("CALCOM_API_KEY")
+    if not calcom_api_key:
+        raise HTTPException(status_code=500, detail="CALCOM_API_KEY not set.")
+    try:
+        payload = {
+            "eventTypeId": CALCOM_EVENT_TYPE_ID,
+            "start": request.start_time,
+            "attendee": {
+                "name": request.name,
+                "email": request.email,
+                "timeZone": request.timezone
+            },
+            "metadata": {},
+            "responses": {
+                "name": request.name,
+                "email": request.email,
+                "notes": request.notes or "Booked via Shahid's AI Persona"
+            }
+        }
+        with httpx.Client() as client:
+            response = client.post(
+                f"{CALCOM_BASE_URL}/bookings",
+                headers=get_calcom_headers(),
+                json=payload
+            )
+        if response.status_code not in [200, 201]:
+            raise HTTPException(status_code=response.status_code, detail=response.text)
+
+        booking = response.json().get("data", {})
+        return {
+            "success": True,
+            "message": f"Interview booked for {request.name}! Confirmation sent to {request.email}. Booking ID: {booking.get('uid', '')}",
+            "booking": {
+                "booking_id": booking.get("uid", ""),
+                "status": booking.get("status", ""),
+                "start": booking.get("start", request.start_time),
+                "end": booking.get("end", ""),
+                "meet_url": booking.get("meetingUrl", "")
+            }
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/ingest", response_model=IngestResponse)
@@ -367,65 +451,6 @@ def trigger_ingestion(background_tasks: BackgroundTasks):
     background_tasks.add_task(run_ingestion_task)
     return {"status": "accepted", "message": "Ingestion task queued in background."}
 
-
-# ── Add these routes to your main.py ──────────────────────────────────────────
-# Also add at top of main.py:
-# from booking import check_availability, book_slot, BookSlotRequest, CheckAvailabilityRequest
-
-@app.post("/check-availability")
-def check_availability_endpoint(request: CheckAvailabilityRequest):
-    """
-    Check available interview slots for a given date.
-    Used by ElevenLabs tool to show available times to caller.
-    """
-    try:
-        slots = check_availability(request.date, request.timezone)
-        if not slots:
-            return {
-                "available": False,
-                "message": f"No available slots on {request.date}. Please try another date.",
-                "slots": []
-            }
-        # Return max 5 slots to keep voice response concise
-        return {
-            "available": True,
-            "date": request.date,
-            "slots": slots[:5],
-            "message": f"Available slots on {request.date}: " + ", ".join(
-                [s[11:16] for s in slots[:5]]  # Extract HH:MM from ISO string
-            )
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/book-slot")
-def book_slot_endpoint(request: BookSlotRequest):
-    """
-    Book an interview slot on Cal.com.
-    Called by ElevenLabs tool after caller confirms a time.
-    """
-    try:
-        booking = book_slot(
-            name=request.name,
-            email=request.email,
-            start_time=request.start_time,
-            timezone=request.timezone,
-            notes=request.notes
-        )
-        return {
-            "success": True,
-            "message": f"Interview booked successfully for {request.name}! "
-                      f"A confirmation has been sent to {request.email}. "
-                      f"Booking ID: {booking['booking_id']}",
-            "booking": booking
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
