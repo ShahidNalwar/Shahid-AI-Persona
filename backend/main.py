@@ -346,7 +346,7 @@ def check_availability_endpoint(request: CheckAvailabilityRequest):
         end = f"{request.date}T23:59:59Z"
         with httpx.Client() as client:
             response = client.get(
-                f"{CALCOM_BASE_URL}/slots",
+                f"{CALCOM_BASE_URL}/slots/available",  # ← fixed
                 headers=get_calcom_headers(),
                 params={
                     "eventTypeId": CALCOM_EVENT_TYPE_ID,
