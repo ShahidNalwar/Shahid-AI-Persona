@@ -1,6 +1,6 @@
 # Shahid Nalwar — AI Persona
 
-> AI persona for the Scaler AI Engineer Intern screening assignment.  
+> AI persona for Virtual Interview.  
 > Call it, chat with it, and book an interview — no human in the loop.
 
 **Live chat**: [shahid-ai-persona.vercel.app](https://shahid-ai-persona.vercel.app)  
@@ -137,9 +137,9 @@ pip install -r requirements.txt
 
 Create `backend/.env.local`:
 ```
-GROQ_API_KEY=gsk_...
-GITHUB_TOKEN=ghp_...
-CALCOM_API_KEY=cal_...
+GROQ_API_KEY
+GITHUB_TOKEN
+CALCOM_API_KEY
 ```
 
 Create `.env.local` in root:
