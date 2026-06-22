@@ -2,7 +2,7 @@
 import { useState, useRef, useEffect } from 'react'
 
 const suggestions = [
-  "Why should Scaler hire Shahid?",
+  "Why should you hire me?",
   "Tell me about Focus Guardian",
   "What is Laptolyze?",
   "Book an interview"
